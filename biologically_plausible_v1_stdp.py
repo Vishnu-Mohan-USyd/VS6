@@ -1182,6 +1182,8 @@ class RgcLgnV1Network:
 
         if self.tc_stp_x is not None:
             self.tc_stp_x.fill(1.0)
+        if self.tc_stp_x_pv is not None:
+            self.tc_stp_x_pv.fill(1.0)
 
         self.stdp.reset()
         self.pp_stdp.reset()
@@ -1590,9 +1592,13 @@ class RgcLgnV1Network:
         saved_stdp_x_post = self.stdp.x_post.copy()
         saved_stdp_x_post_slow = self.stdp.x_post_slow.copy()
         saved_pv_istdp_x_post = self.pv_istdp.x_post.copy()
+        saved_pp_stdp_x_pre = self.pp_stdp.x_pre.copy()
+        saved_pp_stdp_x_post = self.pp_stdp.x_post.copy()
         saved_ee_x_pre = self.ee_stdp.x_pre.copy()
         saved_ee_x_post = self.ee_stdp.x_post.copy()
         saved_prev_v1_spk = self.prev_v1_spk.copy()
+        saved_tc_stp_x = None if self.tc_stp_x is None else self.tc_stp_x.copy()
+        saved_tc_stp_x_pv = None if self.tc_stp_x_pv is None else self.tc_stp_x_pv.copy()
 
         for j, th in enumerate(thetas_deg):
             cnt = np.zeros(self.M, dtype=np.float32)
@@ -1629,9 +1635,15 @@ class RgcLgnV1Network:
         self.stdp.x_post = saved_stdp_x_post
         self.stdp.x_post_slow = saved_stdp_x_post_slow
         self.pv_istdp.x_post = saved_pv_istdp_x_post
+        self.pp_stdp.x_pre = saved_pp_stdp_x_pre
+        self.pp_stdp.x_post = saved_pp_stdp_x_post
         self.ee_stdp.x_pre = saved_ee_x_pre
         self.ee_stdp.x_post = saved_ee_x_post
         self.prev_v1_spk = saved_prev_v1_spk
+        if self.tc_stp_x is not None and saved_tc_stp_x is not None:
+            self.tc_stp_x = saved_tc_stp_x
+        if self.tc_stp_x_pv is not None and saved_tc_stp_x_pv is not None:
+            self.tc_stp_x_pv = saved_tc_stp_x_pv
         self.rng.bit_generator.state = rng_state
 
         return rates
@@ -1769,6 +1781,62 @@ def run_self_tests(out_dir: str) -> None:
     report.append("================")
 
     thetas = np.linspace(0, 180 - 180 / 12, 12)
+
+    # --- Test 0: STP and evaluate_tuning are side-effect free ---
+    p_state = Params(N=8, M=4, seed=3, segment_ms=50)
+    net_state = RgcLgnV1Network(p_state)
+
+    # reset_state() must reset all STP resource variables to the fully-recovered state.
+    if net_state.tc_stp_x is not None:
+        net_state.tc_stp_x.fill(0.25)
+    if net_state.tc_stp_x_pv is not None:
+        net_state.tc_stp_x_pv.fill(0.25)
+    net_state.reset_state()
+    if net_state.tc_stp_x is not None and not np.all(net_state.tc_stp_x == 1.0):
+        raise AssertionError("STP reset test failed: tc_stp_x not fully reset to 1.0")
+    if net_state.tc_stp_x_pv is not None and not np.all(net_state.tc_stp_x_pv == 1.0):
+        raise AssertionError("STP reset test failed: tc_stp_x_pv not fully reset to 1.0")
+
+    # evaluate_tuning() should not perturb ongoing simulation state (including STP resources and RNG).
+    import copy
+    net_state.run_segment(45.0, plastic=True, contrast=1.0)
+    net_state.run_segment(90.0, plastic=False, contrast=1.25)
+    if net_state.tc_stp_x is not None:
+        net_state.tc_stp_x = net_state.rng.random(net_state.tc_stp_x.shape).astype(np.float32)
+    if net_state.tc_stp_x_pv is not None:
+        net_state.tc_stp_x_pv = net_state.rng.random(net_state.tc_stp_x_pv.shape).astype(np.float32)
+    net_state.pp_stdp.x_pre = net_state.rng.random(net_state.pp_stdp.x_pre.shape).astype(np.float32)
+    net_state.pp_stdp.x_post = net_state.rng.random(net_state.pp_stdp.x_post.shape).astype(np.float32)
+
+    snap = {
+        "rng_state": copy.deepcopy(net_state.rng.bit_generator.state),
+        "tc_stp_x": None if net_state.tc_stp_x is None else net_state.tc_stp_x.copy(),
+        "tc_stp_x_pv": None if net_state.tc_stp_x_pv is None else net_state.tc_stp_x_pv.copy(),
+        "pp_x_pre": net_state.pp_stdp.x_pre.copy(),
+        "pp_x_post": net_state.pp_stdp.x_post.copy(),
+        "delay_buf": net_state.delay_buf.copy(),
+        "ptr": int(net_state.ptr),
+    }
+    _ = net_state.evaluate_tuning(np.array([0.0, 90.0], dtype=np.float32), repeats=1, contrast=1.0)
+
+    if snap["tc_stp_x"] is not None and not np.array_equal(net_state.tc_stp_x, snap["tc_stp_x"]):
+        raise AssertionError("Eval state-restore test failed: tc_stp_x mutated")
+    if snap["tc_stp_x_pv"] is not None and not np.array_equal(net_state.tc_stp_x_pv, snap["tc_stp_x_pv"]):
+        raise AssertionError("Eval state-restore test failed: tc_stp_x_pv mutated")
+    if not np.array_equal(net_state.pp_stdp.x_pre, snap["pp_x_pre"]):
+        raise AssertionError("Eval state-restore test failed: pp_stdp.x_pre mutated")
+    if not np.array_equal(net_state.pp_stdp.x_post, snap["pp_x_post"]):
+        raise AssertionError("Eval state-restore test failed: pp_stdp.x_post mutated")
+    if not np.array_equal(net_state.delay_buf, snap["delay_buf"]) or int(net_state.ptr) != snap["ptr"]:
+        raise AssertionError("Eval state-restore test failed: LGN delay buffer state mutated")
+
+    rng_expected = np.random.default_rng()
+    rng_expected.bit_generator.state = snap["rng_state"]
+    expected = rng_expected.random(32)
+    actual = net_state.rng.random(32)
+    if not np.allclose(actual, expected, atol=0.0, rtol=0.0):
+        raise AssertionError("Eval state-restore test failed: RNG state mutated")
+    report.append("Test 0 (State restore): reset_state STP + evaluate_tuning snapshot OK")
 
     # --- Test 1: OSI improves with learning ---
     p = Params(N=8, M=8, seed=1, v1_bias_eta=0.0)
